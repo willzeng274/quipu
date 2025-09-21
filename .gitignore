@@ -1,0 +1,8 @@
+target/
+*.lance
+
+*.bak
+
+.vscode/
+
+data/
