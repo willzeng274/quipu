@@ -4,7 +4,13 @@ A high-performance semantic indexing system designed for extremely parallel/conc
 
 ## Overview
 
-Quipu is built for concurrency testing with files and testing vector database performance under high load. The name was randomly chosen, though it evokes the ancient Incan recording system of knotted strings - fitting for a file indexing system.
+Quipu is built for concurrency testing with files and testing vector database performance under high load. The name was randomly chosen.
+
+## Concurrency Pipeline Example
+
+For a comprehensive demonstration of Quipu's concurrent processing capabilities, see the [pipeline usage example](https://github.com/willzeng274/quipu/blob/main/examples/pipeline_usage.rs).
+
+This example processes 20 test files of varying sizes through a 5-stage pipeline, demonstrating how Quipu handles high-load scenarios with proper resource management and performance monitoring. More comprehensive interfaces will be implemented later. I'm currently benchmarking and profiling memory and CPU usage.
 
 Currently implements the vector database API with LanceDB, providing semantic search capabilities across file metadata, filenames, and content embeddings with async/await throughout.
 
