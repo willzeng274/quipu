@@ -1,11 +1,8 @@
-
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::runtime::Builder;
 use jemallocator::Jemalloc;
 use jemalloc_ctl::{stats, epoch};
 
@@ -21,6 +18,13 @@ use tracing::info;
 
 const DEFAULT_CHANNEL_CAPACITY: usize = 100;
 const MAX_TOKENS_PER_CHUNK: usize = 256;
+
+const NUM_FILES: usize = 20;
+const FILE_READERS: usize = 4;
+const PREPROCESSORS: usize = 4;
+const CHUNKERS: usize = 2;
+const EMBEDDERS: usize = 12;
+
 
 #[derive(Debug, Clone)]
 struct FileInfo {
@@ -53,180 +57,231 @@ struct EmbeddedChunk {
     embedding: Vec<f32>,
 }
 
-fn spawn_file_reader_worker(
-    handle: tokio::runtime::Handle,
+async fn file_reader_worker(
     rx: Arc<Mutex<mpsc::Receiver<PathBuf>>>,
     tx: mpsc::Sender<FileInfo>,
     worker_id: usize,
     content_queue_depth: Arc<AtomicUsize>,
     paths_queue_depth: Arc<AtomicUsize>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        loop {
-            let maybe_path = handle.block_on(async {
-                let mut guard = rx.lock().await;
-                guard.recv().await
-            });
-            let Some(path) = maybe_path else { break };
+    loop {
+        let maybe_path = {
+            // Acquire an asynchronous lock on the Mutex.
+            // If the lock is already held by another worker, this `.await` call will
+            // yield, allowing the Tokio scheduler to run other tasks. This worker
+            // will be woken up once the lock is available.
+            let mut guard = rx.lock().await;
 
-            println!("Reader {}: processing {}", worker_id, path.display());
+            // Once the lock is acquired, receive a path from the channel.
+            // The lock guard is held across this `.await`. This is safe because
+            // the `Mutex` is a Tokio-aware Mutex. The guard will be automatically
+            // released when it goes out of scope at the end of this block.
 
-            paths_queue_depth.fetch_sub(1, Ordering::Relaxed);
+            // Q: What happens if worker1 gets the lock but has to wait for a message
+            //    (at `guard.recv().await`)? Are other workers blocked?
+            // A: Yes, other file_reader workers are "blocked" from accessing this specific
+            //    receiver, but in a good way. When worker2 hits `rx.lock().await`,
+            //    it doesn't block the OS thread. It yields control to the Tokio
+            //    scheduler, which can then run any other ready task (e.g., a
+            //    preprocessor or an embedder). The system remains productive.
+            //    If guard.recv().await doesn't finish, it means there's nothing
+            //    to read yet anyway, so other workers are technically not blocked.
+            guard.recv().await
+        };
+        let Some(path) = maybe_path else { break };
 
-            let file_id = Uuid::new_v4().to_string();
-            match fs::read_to_string(&path) {
-                Ok(content) => {
-                    content_queue_depth.fetch_add(1, Ordering::Relaxed);
-                    let _ = handle.block_on(tx.send(FileInfo { id: file_id, path: path.clone(), content }));
+        println!("Reader {}: processing {}", worker_id, path.display());
+        paths_queue_depth.fetch_sub(1, Ordering::Relaxed);
+
+        // `tokio::fs` operations are asynchronous. Under the hood, Tokio
+        // manages a thread pool dedicated to blocking file system operations.
+        // When you call `read_to_string`, the work is sent to one of those
+        // threads, and the current async task yields. This frees up the
+        // current worker thread to run other async tasks. When the file
+        // read is complete, this task is woken up to continue.
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                content_queue_depth.fetch_add(1, Ordering::Relaxed);
+                let file_id = Uuid::new_v4().to_string();
+                if tx.send(FileInfo { id: file_id, path, content }).await.is_err() {
+                    eprintln!("Reader {}: channel closed.", worker_id);
+                    break;
                 }
-                Err(e) => eprintln!("Reader {} error reading file: {}", worker_id, e),
             }
+            Err(e) => eprintln!("Reader {} error reading file {}: {}", worker_id, path.display(), e),
         }
-    });
+    }
 }
 
-fn spawn_preprocessing_worker(
-    handle: tokio::runtime::Handle,
+async fn preprocessing_worker(
     rx: Arc<Mutex<mpsc::Receiver<FileInfo>>>,
     tx: mpsc::Sender<ProcessedFile>,
     worker_id: usize,
     content_queue_depth: Arc<AtomicUsize>,
     processed_queue_depth: Arc<AtomicUsize>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        loop {
-            let maybe_file = handle.block_on(async {
-                let mut guard = rx.lock().await;
-                guard.recv().await
-            });
-            let Some(file_info) = maybe_file else { break };
+    loop {
+        let maybe_file = {
+            // This follows the same `lock -> recv` pattern as the file_reader_worker.
+            // It allows multiple preprocessor workers to safely share a single
+            // input channel.
+            let mut guard = rx.lock().await;
+            guard.recv().await
+        };
+        let Some(file_info) = maybe_file else { break };
 
-            println!("Preprocessor {}: processing {}", worker_id, file_info.path.display());
+        println!("Preprocessor {}: processing {}", worker_id, file_info.path.display());
 
-            content_queue_depth.fetch_sub(1, Ordering::Relaxed);
-            processed_queue_depth.fetch_add(1, Ordering::Relaxed);
+        content_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        processed_queue_depth.fetch_add(1, Ordering::Relaxed);
 
-            // preprocessing: normalize line endings, trim whitespace
-            // in actual preprocessing we would preprocess PDFs, images, docx, etc
-            let content = file_info.content
-                .replace("\r\n", "\n")
-                .replace("\r", "\n")
-                .trim()
-                .to_string();
-            let _ = handle.block_on(tx.send(ProcessedFile {
-                id: file_info.id,
-                path: file_info.path,
-                content,
-            }));
+        // --- Async vs. Blocking Bar ---
+        // This current preprocessing is just fast string manipulation. It's not
+        // worth the overhead of sending it to a blocking thread.
+        //
+        // However, if this stage involved heavy CPU work (e.g., converting a
+        // PDF/DOCX file to text), it would become a CPU-bound task. In that
+        // case, we would change this worker to a synchronous `fn` and spawn it
+        // with `tokio::task::spawn_blocking` to avoid stalling the async runtime.
+        //
+        // Rule of thumb: A function is async if it *waits* (I/O, network).
+        // It should be on a blocking thread if it *works* (heavy computation).
+        // Any pure CPU task taking more than ~100µs is a good candidate for spawn_blocking.
+        let content = file_info.content
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .trim()
+            .to_string();
+
+        if tx.send(ProcessedFile {
+            id: file_info.id,
+            path: file_info.path,
+            content,
+        }).await.is_err() {
+            eprintln!("Preprocessor {}: channel closed.", worker_id);
+            break;
         }
-    });
+    }
 }
 
-fn spawn_chunking_worker(
-    handle: tokio::runtime::Handle,
+fn chunking_worker(
     rx: Arc<Mutex<mpsc::Receiver<ProcessedFile>>>,
     tx: mpsc::Sender<ChunkJob>,
     worker_id: usize,
     processed_queue_depth: Arc<AtomicUsize>,
     chunks_queue_depth: Arc<AtomicUsize>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let model =
-            SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL12V2)
-                .create_model()
-                .expect("Failed to create tokenizer");
+    // This worker is CPU-bound due to the tokenization model.
+    // It's intentionally a synchronous function (`fn`) and not `async fn`.
+    // It will be run on a dedicated blocking thread using `tokio::task::spawn_blocking`.
+    // This prevents it from hogging a core worker thread from the async runtime,
+    // which is needed for the I/O-bound tasks to remain responsive.
+    let model =
+        SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL12V2)
+            .create_model()
+            .expect("Failed to create tokenizer");
 
-        let target_tokens = MAX_TOKENS_PER_CHUNK;
+    let target_tokens = MAX_TOKENS_PER_CHUNK;
 
-        loop {
-            let maybe_file = handle.block_on(async {
-                let mut guard = rx.lock().await;
-                guard.recv().await
-            });
-            let Some(processed_file) = maybe_file else { break };
+    loop {
+        // Since this is a synchronous function, we cannot use `.await`.
+        // `blocking_lock()` blocks the *current thread* (the spawned blocking
+        // thread) until the mutex lock is acquired. This is the correct and
+        // efficient behaviour here, as this thread's only job is to wait for
+        // work. The lock guard is dropped at the end of the statement,
+        // releasing the lock immediately so another chunker can take its turn.
+        let maybe_file = rx.blocking_lock().blocking_recv();
+        let Some(processed_file) = maybe_file else { break };
 
-            println!("Chunker {}: processing {}", worker_id, processed_file.path.display());
+        println!("Chunker {}: processing {}", worker_id, processed_file.path.display());
+        processed_queue_depth.fetch_sub(1, Ordering::Relaxed);
 
-            processed_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        let mut buf = String::new();
+        let mut token_sum = 0usize;
+        let mut chunk_idx = 0usize;
 
-            let mut buf = String::new();
-            let mut token_sum = 0usize;
-            let mut chunk_idx = 0usize;
-
-            for word in processed_file.content.split_whitespace() {
-                let w_tokens = model.get_tokenizer().tokenize(word).len();
-                if token_sum + w_tokens > target_tokens && !buf.is_empty() {
-                    let chunk_text = std::mem::take(&mut buf);
-                    chunks_queue_depth.fetch_add(1, Ordering::Relaxed);
-                    let _ = handle.block_on(tx.send(ChunkJob {
-                        file_id: processed_file.id.clone(),
-                        file_path: processed_file.path.clone(),
-                        idx: chunk_idx,
-                        text: chunk_text,
-                    }));
-                    chunk_idx += 1;
-                    token_sum = 0;
-                }
-                if !buf.is_empty() {
-                    buf.push(' ');
-                }
-                buf.push_str(word);
-                token_sum += w_tokens;
-            }
-            if !buf.is_empty() {
+        for word in processed_file.content.split_whitespace() {
+            let w_tokens = model.get_tokenizer().tokenize(word).len();
+            if token_sum + w_tokens > target_tokens && !buf.is_empty() {
+                let chunk_text = std::mem::take(&mut buf);
                 chunks_queue_depth.fetch_add(1, Ordering::Relaxed);
-                let _ = handle.block_on(tx.send(ChunkJob {
+                if tx.blocking_send(ChunkJob {
                     file_id: processed_file.id.clone(),
                     file_path: processed_file.path.clone(),
                     idx: chunk_idx,
-                    text: buf,
-                }));
+                    text: chunk_text,
+                }).is_err() {
+                    eprintln!("Chunker {}: channel closed.", worker_id);
+                    return;
+                }
+                chunk_idx += 1;
+                token_sum = 0;
+            }
+            if !buf.is_empty() {
+                buf.push(' ');
+            }
+            buf.push_str(word);
+            token_sum += w_tokens;
+        }
+        if !buf.is_empty() {
+            chunks_queue_depth.fetch_add(1, Ordering::Relaxed);
+            if tx.blocking_send(ChunkJob {
+                file_id: processed_file.id.clone(),
+                file_path: processed_file.path.clone(),
+                idx: chunk_idx,
+                text: buf,
+            }).is_err() {
+                eprintln!("Chunker {}: channel closed.", worker_id);
+                return;
             }
         }
-    });
+    }
 }
 
-fn spawn_embedding_worker(
-    handle: tokio::runtime::Handle,
+fn embedding_worker(
     rx: Arc<Mutex<mpsc::Receiver<ChunkJob>>>,
     tx: mpsc::Sender<EmbeddedChunk>,
     worker_id: usize,
     chunks_queue_depth: Arc<AtomicUsize>,
     embeddings_queue_depth: Arc<AtomicUsize>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let model = SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL12V2)
-            .with_device(tch::Device::Cpu)
-            .create_model()
-            .expect("model init");
+    // This worker is very CPU-bound due to running the embedding model.
+    // Like the chunking_worker, it is a synchronous `fn` designed to be run
+    // with `tokio::task::spawn_blocking`.
+    let model = SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL12V2)
+        .with_device(tch::Device::Cpu)
+        .create_model()
+        .expect("model init");
 
-        loop {
-            let maybe_job = handle.block_on(async {
-                let mut guard = rx.lock().await;
-                guard.recv().await
-            });
-            let Some(job) = maybe_job else { break };
+    loop {
+        // This uses the same `blocking_lock` and `blocking_recv` pattern as the
+        // chunking worker. It blocks its dedicated thread to wait for a chunk
+        // job, processes it, and then loops to wait for the next one.
+        let maybe_job = rx.blocking_lock().blocking_recv();
+        let Some(job) = maybe_job else { break };
 
-            println!("Embedder {}: processing chunk {} from {}", worker_id, job.idx, job.file_path.display());
+        println!("Embedder {}: processing chunk {} from {}", worker_id, job.idx, job.file_path.display());
 
-            chunks_queue_depth.fetch_sub(1, Ordering::Relaxed);
-            embeddings_queue_depth.fetch_add(1, Ordering::Relaxed);
+        chunks_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        embeddings_queue_depth.fetch_add(1, Ordering::Relaxed);
 
-            match model.encode(&[job.text]) {
-                Ok(embeddings) => {
-                    if let Some(embedding) = embeddings.into_iter().next() {
-                        let _ = handle.block_on(tx.send(EmbeddedChunk {
-                            file_id: job.file_id,
-                            file_path: job.file_path,
-                            idx: job.idx,
-                            embedding,
-                        }));
+        match model.encode(&[job.text]) {
+            Ok(embeddings) => {
+                if let Some(embedding) = embeddings.into_iter().next() {
+                    if tx.blocking_send(EmbeddedChunk {
+                        file_id: job.file_id,
+                        file_path: job.file_path,
+                        idx: job.idx,
+                        embedding,
+                    }).is_err() {
+                        eprintln!("Embedder {}: channel closed.", worker_id);
+                        return;
                     }
                 }
-                Err(e) => eprintln!("Embedder {} encode failed for chunk {}: {}", worker_id, job.idx, e),
             }
+            Err(e) => eprintln!("Embedder {} encode failed for chunk {}: {}", worker_id, job.idx, e),
         }
-    });
+    }
 }
 
 /// Counter (final) stage: Consumes the stream and counts results.
@@ -240,8 +295,7 @@ async fn counter_stage(embeddings_rx: Arc<Mutex<mpsc::Receiver<EmbeddedChunk>>>,
         embeddings_queue_depth.fetch_sub(1, Ordering::Relaxed);
 
         count += 1;
-        println!("completed: {} -> chunk {} (dim={})",
-                 chunk.file_path.display(), chunk.idx, chunk.embedding.len());
+        println!("completed: {} -> chunk {} (dim={})", chunk.file_path.display(), chunk.idx, chunk.embedding.len());
     }
     println!("Counter: processed {} total chunks", count);
     count
@@ -326,81 +380,20 @@ fn create_test_files(dir: &Path, num_files: usize) -> Result<Vec<PathBuf>, Box<d
             .join("");
 
         let content_len = content.len();
-        fs::write(&file_path, &content)?;
+        std::fs::write(&file_path, &content)?;
         println!("Created test file: {} ({} bytes)", file_path.display(), content_len);
         paths.push(file_path);
     }
     Ok(paths)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let reader_runtime = Builder::new_multi_thread()
-        .worker_threads(1)
-        .thread_name("reader-worker")
-        .enable_all()
-        .build()
-        .expect("Failed to build reader runtime");
-
-    let preprocessor_runtime = Arc::new(Builder::new_multi_thread()
-        .worker_threads(1)
-        .thread_name("preprocessor-worker")
-        .enable_all()
-        .build()
-        .expect("Failed to build preprocessor runtime"));
-
-    let chunker_runtime = Arc::new(Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("chunker-worker")
-        .enable_all()
-        .build()
-        .expect("Failed to build chunker runtime"));
-
-    let embedder_runtime = Arc::new(Builder::new_multi_thread()
-        .worker_threads(12)
-        .thread_name("embedder-worker")
-        .enable_all()
-        .build()
-        .expect("Failed to build embedder runtime"));
-
-    let monitor_runtime = Arc::new(Builder::new_multi_thread()
-        .worker_threads(1)
-        .thread_name("monitor-worker")
-        .enable_all()
-        .build()
-        .expect("Failed to build monitor runtime"));
-
-    // since run_pipeline includes reader
-    let result = reader_runtime.block_on(async {
-        run_pipeline(
-            preprocessor_runtime.clone(),
-            chunker_runtime.clone(),
-            embedder_runtime.clone(),
-            monitor_runtime.clone(),
-        ).await
-    });
-
-    drop(reader_runtime);
-
-    result
-}
-
-async fn run_pipeline(
-    preprocessor_runtime: Arc<tokio::runtime::Runtime>,
-    chunker_runtime: Arc<tokio::runtime::Runtime>,
-    embedder_runtime: Arc<tokio::runtime::Runtime>,
-    monitor_runtime: Arc<tokio::runtime::Runtime>,
-) -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter("pipeline_usage=info")
         .init();
 
-    info!("Starting pipeline benchmark with separate Tokio runtimes per stage.");
-
-    let num_files = 20;
-    let file_readers = 1;
-    let preprocessors = 1;
-    let chunkers = 2;
-    let embedders = 12;
+    info!("Starting pipeline usage example");
 
     // for monitoring
     let paths_queue_depth = Arc::new(AtomicUsize::new(0));
@@ -429,7 +422,7 @@ async fn run_pipeline(
     let monitor_chunks_depth = chunks_queue_depth.clone();
     let monitor_embeddings_depth = embeddings_queue_depth.clone();
 
-    let monitor_handle = monitor_runtime.spawn(async move {
+    let monitor_handle = tokio::spawn(async move {
         monitor_channels(
             monitor_paths_depth,
             monitor_content_depth,
@@ -440,45 +433,44 @@ async fn run_pipeline(
         .await
     });
     
-    // File readers -> preprocessors
-    for i in 0..file_readers {
+    // File readers are I/O-bound, so they are spawned as regular async tasks
+    // on the main Tokio runtime.
+    for i in 0..FILE_READERS {
         let rx_clone = shared_input_paths_rx.clone();
         let tx_clone = file_content_tx.clone();
-        let handle = tokio::runtime::Handle::current();
-        spawn_file_reader_worker(handle, rx_clone, tx_clone, i, content_queue_depth.clone(), paths_queue_depth.clone());
+        let content_depth = content_queue_depth.clone();
+        let paths_depth = paths_queue_depth.clone();
+        tokio::spawn(file_reader_worker(rx_clone, tx_clone, i, content_depth, paths_depth));
     }
     drop(file_content_tx);
 
-    // Preprocessors -> chunkers
-    for i in 0..preprocessors {
+    // Preprocessors are very fast, so they also run as regular async tasks.
+    for i in 0..PREPROCESSORS {
         let rx_clone = shared_file_content_rx.clone();
         let tx_clone = processed_tx.clone();
         let content_depth = content_queue_depth.clone();
         let processed_depth = processed_queue_depth.clone();
 
-        preprocessor_runtime.spawn(async move {
-            spawn_preprocessing_worker(
-                tokio::runtime::Handle::current(),
-                rx_clone,
-                tx_clone,
-                i,
-                content_depth,
-                processed_depth,
-            );
-        });
+        tokio::spawn(preprocessing_worker(
+            rx_clone,
+            tx_clone,
+            i,
+            content_depth,
+            processed_depth,
+        ));
     }
     drop(processed_tx);
 
-    // Chunkers -> embedders
-    for i in 0..chunkers {
+    // Chunkers are CPU-bound, so they are spawned on Tokio's blocking thread pool.
+    // This prevents them from blocking the main runtime, keeping I/O tasks responsive.
+    for i in 0..CHUNKERS {
         let rx_clone = shared_processed_rx.clone();
         let tx_clone = chunk_job_tx.clone();
         let processed_depth = processed_queue_depth.clone();
         let chunks_depth = chunks_queue_depth.clone();
 
-        chunker_runtime.spawn(async move {
-            spawn_chunking_worker(
-                tokio::runtime::Handle::current(),
+        tokio::task::spawn_blocking(move || {
+            chunking_worker(
                 rx_clone,
                 tx_clone,
                 i,
@@ -489,15 +481,15 @@ async fn run_pipeline(
     }
     drop(chunk_job_tx);
 
-    for i in 0..embedders {
+    // Embedders are very CPU-bound and are also spawned on the blocking thread pool.
+    for i in 0..EMBEDDERS {
         let rx_clone = shared_chunk_job_rx.clone();
         let tx_clone = embeddings_tx.clone();
         let chunks_depth = chunks_queue_depth.clone();
         let embeddings_depth = embeddings_queue_depth.clone();
 
-        embedder_runtime.spawn(async move {
-            spawn_embedding_worker(
-                tokio::runtime::Handle::current(),
+        tokio::task::spawn_blocking(move || {
+            embedding_worker(
                 rx_clone,
                 tx_clone,
                 i,
@@ -508,14 +500,14 @@ async fn run_pipeline(
     }
     drop(embeddings_tx);
     
-    // sink, consumes and returns the total count
+    // The final counter stage is a lightweight async task.
     let counter_embeddings_depth = embeddings_queue_depth.clone();
     let counter_handle = tokio::spawn(counter_stage(shared_embeddings_rx.clone(), counter_embeddings_depth));
 
     let temp_dir = tempfile::tempdir()?;
-    let file_paths = create_test_files(temp_dir.path(), num_files)?;
+    let file_paths = create_test_files(temp_dir.path(), NUM_FILES)?;
 
-    println!("Created {} test files with varying lengths", num_files);
+    println!("Created {} test files with varying lengths", NUM_FILES);
     let paths_depth_for_enqueue = paths_queue_depth.clone();
     for path in file_paths {
         println!("enqueue: {}", path.display());
